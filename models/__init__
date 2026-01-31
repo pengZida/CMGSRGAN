@@ -1,0 +1,19 @@
+# 模型包初始化，PyCharm自动识别，无需添加代码
+from .base_modules import RDB
+from .stage1_modules import (DualPathEncoding, MultiScaleFeaturePyramid,
+                             HierarchicalCrossModalAttention, AdaptiveGatingFusion,
+                             FeatureRefinementUpsampling, G2_DownSampling)
+from .stage2_modules import ChannelAttentionBlock, G3_Generator
+from .discriminator import PatchGANDiscriminator
+
+__all__ = [
+    # base
+    'RDB',
+    # stage1
+    'DualPathEncoding', 'MultiScaleFeaturePyramid', 'HierarchicalCrossModalAttention',
+    'AdaptiveGatingFusion', 'FeatureRefinementUpsampling', 'G2_DownSampling',
+    # stage2
+    'ChannelAttentionBlock', 'G3_Generator',
+    # discriminator
+    'PatchGANDiscriminator'
+]

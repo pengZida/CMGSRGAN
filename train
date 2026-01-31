@@ -1,0 +1,327 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+# 导入项目内所有模块
+from config import *
+from utils import set_seed, create_checkpoint_dir
+from models import *  # 导入所有模型模块
+from loss_functions import FullLossCalculator
+from dataset import CMGSRGANDataset
+
+def train():
+    # 1. 初始化准备（固定种子、创建权重目录、检测PyTorch版本）
+    set_seed(42)
+    create_checkpoint_dir()
+    if torch.__version__ != '1.8.0':
+        print(f"【警告】当前PyTorch版本：{torch.__version__}，建议使用1.8.0以保证兼容性")
+    print(f"【设备信息】使用GPU数量：{N_GPUS}，设备：{DEVICE}")
+    print(f"【训练参数】Stage1:{STAGE1_ITER}迭代 | Stage2:{STAGE2_ITER}迭代 | Finetune:{FINETUNE_ITER}迭代")
+
+    # 2. 初始化数据集和DataLoader
+    dataset = CMGSRGANDataset(num_samples=100000)  # 足够样本支撑迭代数
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+                            num_workers=DATASET_NUM_WORKERS, pin_memory=True)
+    dataloader_iter = iter(dataloader)
+
+    # 3. 初始化所有模型并移至设备
+    # 第一阶段模型
+    dual_encoder = DualPathEncoding().to(DEVICE)
+    feature_pyramid = MultiScaleFeaturePyramid().to(DEVICE)
+    cross_attn = HierarchicalCrossModalAttention().to(DEVICE)
+    gating_fusion = AdaptiveGatingFusion().to(DEVICE)
+    G1 = FeatureRefinementUpsampling().to(DEVICE)
+    G2 = G2_DownSampling().to(DEVICE)
+    # 第二阶段模型
+    G3 = G3_Generator().to(DEVICE)
+    # 鉴别器
+    D1 = PatchGANDiscriminator().to(DEVICE)
+    D2 = PatchGANDiscriminator().to(DEVICE)
+    D3 = PatchGANDiscriminator().to(DEVICE)
+
+    # 多GPU适配（DataParallel，自动适配3个2080Ti）
+    if N_GPUS > 1:
+        print(f"【多GPU训练】启用{N_GPUS}个GPU并行训练")
+        dual_encoder = nn.DataParallel(dual_encoder)
+        feature_pyramid = nn.DataParallel(feature_pyramid)
+        cross_attn = nn.DataParallel(cross_attn)
+        gating_fusion = nn.DataParallel(gating_fusion)
+        G1 = nn.DataParallel(G1)
+        G2 = nn.DataParallel(G2)
+        G3 = nn.DataParallel(G3)
+        D1 = nn.DataParallel(D1)
+        D2 = nn.DataParallel(D2)
+        D3 = nn.DataParallel(D3)
+
+    # 4. 初始化损失计算器和优化器
+    loss_calc = FullLossCalculator(β=BETA, γ=GAMMA, vgg_layers=VGG_LAYERS, device=DEVICE).to(DEVICE)
+    # 4.1 第一阶段优化器（G1/G2 + D1/D2，Adam: β1=0.5, β2=0.999, 无权重衰减）
+    optim_G1G2 = optim.Adam(
+        list(dual_encoder.parameters()) + list(feature_pyramid.parameters()) +
+        list(cross_attn.parameters()) + list(gating_fusion.parameters()) +
+        list(G1.parameters()) + list(G2.parameters()),
+        lr=STAGE1_LR, betas=(0.5, 0.999), weight_decay=0.0
+    )
+    optim_D1D2 = optim.Adam(
+        list(D1.parameters()) + list(D2.parameters()),
+        lr=STAGE1_LR, betas=(0.5, 0.999), weight_decay=0.0
+    )
+    # 4.2 第二阶段优化器（G3 + D3，同配置，初始LR=1e-4）
+    optim_G3 = optim.Adam(G3.parameters(), lr=STAGE2_LR, betas=(0.5, 0.999), weight_decay=0.0)
+    optim_D3 = optim.Adam(D3.parameters(), lr=STAGE2_LR, betas=(0.5, 0.999), weight_decay=0.0)
+    # 4.3 微调阶段优化器（所有模型，固定LR=1e-5）
+    optim_all = optim.Adam(
+        list(dual_encoder.parameters()) + list(feature_pyramid.parameters()) +
+        list(cross_attn.parameters()) + list(gating_fusion.parameters()) +
+        list(G1.parameters()) + list(G2.parameters()) + list(G3.parameters()) +
+        list(D1.parameters()) + list(D2.parameters()) + list(D3.parameters()),
+        lr=FINETUNE_LR, betas=(0.5, 0.999), weight_decay=0.0
+    )
+
+    # ---------------------- 阶段1：训练第一阶段（20000迭代） ----------------------
+    print("\n" + "="*50)
+    print("开始训练第一阶段（Stage1: 20000迭代）")
+    print("="*50)
+    dual_encoder.train()
+    feature_pyramid.train()
+    cross_attn.train()
+    gating_fusion.train()
+    G1.train()
+    G2.train()
+    D1.train()
+    D2.train()
+
+    for iter_idx in range(1, STAGE1_ITER + 1):
+        # 学习率调度：每1000迭代减半
+        if iter_idx % LR_DECAY_STEP == 0:
+            for param_group in optim_G1G2.param_groups:
+                param_group['lr'] *= 0.5
+            for param_group in optim_D1D2.param_groups:
+                param_group['lr'] *= 0.5
+            print(f"Stage1 迭代{iter_idx}：学习率调整为 {optim_G1G2.param_groups[0]['lr']:.6f}")
+
+        # 循环加载数据（避免DataLoader迭代完毕）
+        try:
+            x, z, y_plus = next(dataloader_iter)
+        except StopIteration:
+            dataloader_iter = iter(dataloader)
+            x, z, y_plus = next(dataloader_iter)
+        x, z, y_plus = x.to(DEVICE), z.to(DEVICE), y_plus.to(DEVICE)
+
+        # ---------------------- 训练生成器 G1+G2 ----------------------
+        optim_G1G2.zero_grad()
+        # G1前向：x+z → y'（256x256初始重建图）
+        lr_feats, de_feats = dual_encoder(x, z)
+        lr_scales, de_scales = feature_pyramid(lr_feats, de_feats)
+        weighted_feats = cross_attn(lr_scales, de_scales)
+        fused_feat, _ = gating_fusion(weighted_feats)
+        yprime = G1(fused_feat)
+        # G2前向：y' → G2(y')，转换为3通道适配D2和循环损失
+        G2_out = G2(yprime)
+        G2_out_3ch = F.conv2d(G2_out, torch.ones(3, 64, 1, 1).to(DEVICE)/64, padding=0)
+        # 反向循环：G1(G2(y'), z) → 重建y'
+        lr_feats_g2, de_feats_g2 = dual_encoder(G2_out_3ch, z)
+        lr_scales_g2, de_scales_g2 = feature_pyramid(lr_feats_g2, de_feats_g2)
+        weighted_feats_g2 = cross_attn(lr_scales_g2, de_scales_g2)
+        fused_feat_g2, _ = gating_fusion(weighted_feats_g2)
+        G1_G2_yprime_z = G1(fused_feat_g2)
+        # 鉴别器输出
+        D1_out_fake = D1(y_plus, yprime)
+        D2_out_fake = D2(x, G2_out_3ch)
+        # 计算损失并反向传播
+        L_G1 = loss_calc.calc_L_G1(D1_out_fake)
+        L_G2 = loss_calc.calc_L_G2(D2_out_fake)
+        L_C = loss_calc.calc_L_C(G2_out_3ch, x, G1_G2_yprime_z, yprime)
+        L_total_s1 = loss_calc.calc_L_total_s1(L_G1, L_G2, L_C)
+        L_total_s1.backward()
+        optim_G1G2.step()
+
+        # ---------------------- 训练鉴别器 D1+D2 ----------------------
+        optim_D1D2.zero_grad()
+        # D1损失（生成器梯度不回传）
+        D1_out_real = D1(y_plus, y_plus)
+        D1_out_fake_detach = D1(y_plus, yprime.detach())
+        L_D1 = loss_calc.calc_L_D1(D1_out_real, D1_out_fake_detach)
+        # D2损失
+        D2_out_real = D2(x, x)
+        D2_out_fake_detach = D2(x, G2_out_3ch.detach())
+        L_D2 = loss_calc.calc_L_D2(D2_out_real, D2_out_fake_detach)
+        # 总损失并反向传播
+        L_D_total = L_D1 + L_D2
+        L_D_total.backward()
+        optim_D1D2.step()
+
+        # 打印训练日志（每100迭代）
+        if iter_idx % 100 == 0:
+            print(f"Stage1 [{iter_idx}/{STAGE1_ITER}] | L_total_s1: {L_total_s1.item():.4f} | L_D1: {L_D1.item():.4f} | L_D2: {L_D2.item():.4f}")
+
+    # 保存第一阶段权重
+    torch.save({
+        'dual_encoder': dual_encoder.state_dict(),
+        'feature_pyramid': feature_pyramid.state_dict(),
+        'cross_attn': cross_attn.state_dict(),
+        'gating_fusion': gating_fusion.state_dict(),
+        'G1': G1.state_dict(),
+        'G2': G2.state_dict(),
+        'D1': D1.state_dict(),
+        'D2': D2.state_dict(),
+        'optim_G1G2': optim_G1G2.state_dict(),
+        'optim_D1D2': optim_D1D2.state_dict()
+    }, STAGE1_CKPT)
+    print(f"\n第一阶段训练完成，权重保存至：{STAGE1_CKPT}")
+
+    # ---------------------- 阶段2：训练第二阶段（10000迭代） ----------------------
+    print("\n" + "="*50)
+    print("开始训练第二阶段（Stage2: 10000迭代）")
+    print("="*50)
+    G3.train()
+    D3.train()
+    dataloader_iter = iter(dataloader)  # 重置数据迭代器
+
+    for iter_idx in range(1, STAGE2_ITER + 1):
+        # 学习率调度：每1000迭代减半
+        if iter_idx % LR_DECAY_STEP == 0:
+            for param_group in optim_G3.param_groups:
+                param_group['lr'] *= 0.5
+            for param_group in optim_D3.param_groups:
+                param_group['lr'] *= 0.5
+            print(f"Stage2 迭代{iter_idx}：学习率调整为 {optim_G3.param_groups[0]['lr']:.6f}")
+
+        # 加载数据
+        try:
+            x, z, y_plus = next(dataloader_iter)
+        except StopIteration:
+            dataloader_iter = iter(dataloader)
+            x, z, y_plus = next(dataloader_iter)
+        x, z, y_plus = x.to(DEVICE), z.to(DEVICE), y_plus.to(DEVICE)
+
+        # ---------------------- 训练生成器 G3 ----------------------
+        optim_G3.zero_grad()
+        # 先通过G1生成y'（第一阶段模型固定，无需梯度）
+        with torch.no_grad():
+            lr_feats, de_feats = dual_encoder(x, z)
+            lr_scales, de_scales = feature_pyramid(lr_feats, de_feats)
+            weighted_feats = cross_attn(lr_scales, de_scales)
+            fused_feat, _ = gating_fusion(weighted_feats)
+            yprime = G1(fused_feat)
+        # G3前向：y' → 512x512超分图
+        G3_G1_xz = G3(yprime)
+        # D3输出
+        D3_out_fake = D3(z, G3_G1_xz)
+        # 计算损失并反向传播
+        L_G3 = loss_calc.calc_L_G3(D3_out_fake)
+        L_CMP = loss_calc.calc_L_CMP(G3_G1_xz, z)
+        L_total_s2 = loss_calc.calc_L_total_s2(L_G3, L_CMP)
+        L_total_s2.backward()
+        optim_G3.step()
+
+        # ---------------------- 训练鉴别器 D3 ----------------------
+        optim_D3.zero_grad()
+        D3_out_real = D3(z, z)
+        D3_out_fake_detach = D3(z, G3_G1_xz.detach())
+        L_D3 = loss_calc.calc_L_D3(D3_out_real, D3_out_fake_detach)
+        L_D3.backward()
+        optim_D3.step()
+
+        # 打印训练日志（每100迭代）
+        if iter_idx % 100 == 0:
+            print(f"Stage2 [{iter_idx}/{STAGE2_ITER}] | L_total_s2: {L_total_s2.item():.4f} | L_D3: {L_D3.item():.4f}")
+
+    # 保存第二阶段权重
+    torch.save({
+        'G3': G3.state_dict(),
+        'D3': D3.state_dict(),
+        'optim_G3': optim_G3.state_dict(),
+        'optim_D3': optim_D3.state_dict()
+    }, STAGE2_CKPT)
+    print(f"\n第二阶段训练完成，权重保存至：{STAGE2_CKPT}")
+
+    # ---------------------- 阶段3：微调整个网络（2000迭代） ----------------------
+    print("\n" + "="*50)
+    print("开始微调整个网络（Finetune: 2000迭代）")
+    print("="*50)
+    # 所有模型设为训练模式
+    dual_encoder.train()
+    feature_pyramid.train()
+    cross_attn.train()
+    gating_fusion.train()
+    G1.train()
+    G2.train()
+    G3.train()
+    D1.train()
+    D2.train()
+    D3.train()
+    dataloader_iter = iter(dataloader)  # 重置数据迭代器
+
+    for iter_idx in range(1, FINETUNE_ITER + 1):
+        # 加载数据
+        try:
+            x, z, y_plus = next(dataloader_iter)
+        except StopIteration:
+            dataloader_iter = iter(dataloader)
+            x, z, y_plus = next(dataloader_iter)
+        x, z, y_plus = x.to(DEVICE), z.to(DEVICE), y_plus.to(DEVICE)
+
+        # ---------------------- 联合训练所有模型 ----------------------
+        optim_all.zero_grad()
+        # 完整前向流程
+        lr_feats, de_feats = dual_encoder(x, z)
+        lr_scales, de_scales = feature_pyramid(lr_feats, de_feats)
+        weighted_feats = cross_attn(lr_scales, de_scales)
+        fused_feat, _ = gating_fusion(weighted_feats)
+        yprime = G1(fused_feat)  # G1输出
+        G2_out = G2(yprime)     # G2输出
+        G2_out_3ch = F.conv2d(G2_out, torch.ones(3, 64, 1, 1).to(DEVICE)/64, padding=0)
+        G3_G1_xz = G3(yprime)   # G3输出
+        # 反向循环（循环一致性损失）
+        lr_feats_g2, de_feats_g2 = dual_encoder(G2_out_3ch, z)
+        lr_scales_g2, de_scales_g2 = feature_pyramid(lr_feats_g2, de_feats_g2)
+        weighted_feats_g2 = cross_attn(lr_scales_g2, de_scales_g2)
+        fused_feat_g2, _ = gating_fusion(weighted_feats_g2)
+        G1_G2_yprime_z = G1(fused_feat_g2)
+        # 所有鉴别器输出
+        D1_out_fake = D1(y_plus, yprime)
+        D2_out_fake = D2(x, G2_out_3ch)
+        D3_out_fake = D3(z, G3_G1_xz)
+        # 计算所有损失
+        L_G1 = loss_calc.calc_L_G1(D1_out_fake)
+        L_G2 = loss_calc.calc_L_G2(D2_out_fake)
+        L_G3 = loss_calc.calc_L_G3(D3_out_fake)
+        L_C = loss_calc.calc_L_C(G2_out_3ch, x, G1_G2_yprime_z, yprime)
+        L_CMP = loss_calc.calc_L_CMP(G3_G1_xz, z)
+        # 总微调损失（第一+第二阶段损失之和）
+        L_TG_s1 = L_G1 + L_G2
+        L_TG_s2 = L_G3
+        L_total_finetune = (L_TG_s1 + BETA * L_C) + (L_TG_s2 + GAMMA * L_CMP)
+        # 反向传播
+        L_total_finetune.backward()
+        optim_all.step()
+
+        # 打印训练日志（每100迭代）
+        if iter_idx % 100 == 0:
+            print(f"Finetune [{iter_idx}/{FINETUNE_ITER}] | L_total: {L_total_finetune.item():.4f}")
+
+    # 保存最终权重
+    torch.save({
+        'dual_encoder': dual_encoder.state_dict(),
+        'feature_pyramid': feature_pyramid.state_dict(),
+        'cross_attn': cross_attn.state_dict(),
+        'gating_fusion': gating_fusion.state_dict(),
+        'G1': G1.state_dict(),
+        'G2': G2.state_dict(),
+        'G3': G3.state_dict(),
+        'D1': D1.state_dict(),
+        'D2': D2.state_dict(),
+        'D3': D3.state_dict(),
+        'optim_all': optim_all.state_dict()
+    }, FINAL_CKPT)
+    print(f"\n微调完成，最终权重保存至：{FINAL_CKPT}")
+    print("\n" + "="*50)
+    print("CMG-SRGAN 全阶段训练完成！")
+    print("="*50)
+
+# 执行训练
+if __name__ == "__main__":
+    train()

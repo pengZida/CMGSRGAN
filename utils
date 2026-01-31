@@ -1,0 +1,20 @@
+import random
+import numpy as np
+import torch
+import os
+from config import CHECKPOINT_SAVE_PATH
+
+def set_seed(seed=42):
+    """固定随机种子（保证实验可复现，匹配你的训练细节）"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def create_checkpoint_dir():
+    """创建权重保存目录，避免路径不存在报错"""
+    if not os.path.exists(CHECKPOINT_SAVE_PATH):
+        os.makedirs(CHECKPOINT_SAVE_PATH)

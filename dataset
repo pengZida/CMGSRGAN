@@ -1,0 +1,32 @@
+import torch
+from torch.utils.data import Dataset
+
+class CMGSRGANDataset(Dataset):
+    """CMG-SRGAN专用数据集类
+    输入：LR临床图(x:128x128)、皮肤镜图(z:512x512)、真实HR临床图(y_plus:256x256)
+    请修改__getitem__方法中的【模拟数据部分】为你的真实数据读取/预处理逻辑
+    """
+    def __init__(self, num_samples=100000):
+        """
+        Args:
+            num_samples: 数据集总样本数（需足够支撑训练迭代数）
+        """
+        self.num_samples = num_samples
+        # 【可选】在这里添加你的数据路径列表、预处理变换等
+        # 示例：self.img_paths = os.listdir("./your_data_path/")
+
+    def __len__(self):
+        """返回数据集总样本数"""
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        """
+        核心：修改此方法为真实数据读取逻辑
+        返回：x (LR临床图)、z (皮肤镜图)、y_plus (真实HR临床图)，均为torch.Tensor [3, H, W]
+        """
+        # ---------------------- 【模拟数据：请替换为你的真实数据读取】 ----------------------
+        x = torch.randn(3, 128, 128)    # LR临床图：[3,128,128]
+        z = torch.randn(3, 512, 512)    # 皮肤镜图：[3,512,512]
+        y_plus = torch.randn(3, 256, 256)  # 真实HR临床图：[3,256,256]
+        # ----------------------------------------------------------------------------------
+        return x, z, y_plus

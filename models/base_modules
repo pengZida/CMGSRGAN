@@ -1,0 +1,28 @@
+import torch
+import torch.nn as nn
+
+class RDB(nn.Module):
+    """残差密集块（Residual Dense Block），G1/G3共享基础模块"""
+    def __init__(self, in_channels, growth_rate=32, num_layers=4):
+        super().__init__()
+        self.num_layers = num_layers
+        self.growth_rate = growth_rate
+        layers = []
+        for i in range(num_layers):
+            layers.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels + i * growth_rate, growth_rate, 3, 1, 1, padding_mode='reflect'),
+                    nn.ReLU(inplace=True),
+                    nn.InstanceNorm2d(growth_rate)
+                )
+            )
+        self.layers = nn.ModuleList(layers)
+        self.local_conv = nn.Conv2d(in_channels + num_layers * growth_rate, in_channels, 1, 1, 0)
+
+    def forward(self, x):
+        feat = x
+        for layer in self.layers:
+            new_feat = layer(feat)
+            feat = torch.cat([feat, new_feat], dim=1)
+        local_feat = self.local_conv(feat)
+        return local_feat + x

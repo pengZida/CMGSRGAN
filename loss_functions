@@ -1,0 +1,106 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+from config import DEVICE, VGG_LAYERS, BETA, GAMMA  # 导入配置参数
+
+class VGG19FeatureExtractor(nn.Module):
+    """VGG19前l层特征提取器（φ_l(·)），跨模态感知损失专用，冻结参数"""
+    def __init__(self, l=VGG_LAYERS, device=DEVICE):
+        super().__init__()
+        # 加载预训练VGG19
+        vgg19 = models.vgg19(pretrained=True).features.to(device)
+        # 冻结所有参数，仅作为特征提取器
+        for param in vgg19.parameters():
+            param.requires_grad = False
+        # 取前l层作为特征提取器
+        self.feature_extractor = nn.Sequential(*list(vgg19.children())[:l])
+        # VGG默认图像归一化参数
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+        self.device = device
+
+    def forward(self, x):
+        """输入图像值域[-1,1] → 转换为VGG适配的[0,1]并归一化"""
+        x = (x + 1) / 2.0
+        x = (x - self.mean) / self.std
+        return self.feature_extractor(x)
+
+class FullLossCalculator(nn.Module):
+    """完整损失计算器：包含所有GAN损失、循环一致性损失、跨模态感知损失"""
+    def __init__(self, β=BETA, γ=GAMMA, vgg_layers=VGG_LAYERS, device=DEVICE):
+        super().__init__()
+        self.β = β
+        self.γ = γ
+        self.device = device
+        self.epsilon = 1e-8  # 避免log(0)导致NaN
+        self.vgg_extractor = VGG19FeatureExtractor(l=vgg_layers, device=device)
+
+    # ---------------------- GAN生成器损失 ----------------------
+    def calc_L_G1(self, D1_out_fake):
+        """公式5：L_G1 = -1/N * sum(log(D1(G1(x,z))))"""
+        d1_fake_mean = D1_out_fake.view(D1_out_fake.shape[0], -1).mean(dim=1)
+        log_term = torch.log(d1_fake_mean + self.epsilon)
+        return -torch.mean(log_term)
+
+    def calc_L_G2(self, D2_out_fake):
+        """公式6：L_G2 = -1/N * sum(log(D2(G2(y'))))"""
+        d2_fake_mean = D2_out_fake.view(D2_out_fake.shape[0], -1).mean(dim=1)
+        log_term = torch.log(d2_fake_mean + self.epsilon)
+        return -torch.mean(log_term)
+
+    def calc_L_G3(self, D3_out_fake):
+        """公式7：L_G3 = -1/N * sum(log(D3(G3(y'))))"""
+        d3_fake_mean = D3_out_fake.view(D3_out_fake.shape[0], -1).mean(dim=1)
+        log_term = torch.log(d3_fake_mean + self.epsilon)
+        return -torch.mean(log_term)
+
+    # ---------------------- GAN鉴别器损失 ----------------------
+    def calc_L_D1(self, D1_out_real, D1_out_fake):
+        """公式8：L_D1 = -1/N * sum(log(D1(y+)) + log(1-D1(G1(x,z))))"""
+        d1_real_mean = D1_out_real.view(D1_out_real.shape[0], -1).mean(dim=1)
+        log_real = torch.log(d1_real_mean + self.epsilon)
+        d1_fake_mean = D1_out_fake.view(D1_out_fake.shape[0], -1).mean(dim=1)
+        log_fake = torch.log(1 - d1_fake_mean + self.epsilon)
+        return -torch.mean(log_real + log_fake)
+
+    def calc_L_D2(self, D2_out_real, D2_out_fake):
+        """公式9：L_D2 = -1/N * sum(log(D2(x)) + log(1-D2(G2(y'))))"""
+        d2_real_mean = D2_out_real.view(D2_out_real.shape[0], -1).mean(dim=1)
+        log_real = torch.log(d2_real_mean + self.epsilon)
+        d2_fake_mean = D2_out_fake.view(D2_out_fake.shape[0], -1).mean(dim=1)
+        log_fake = torch.log(1 - d2_fake_mean + self.epsilon)
+        return -torch.mean(log_real + log_fake)
+
+    def calc_L_D3(self, D3_out_real, D3_out_fake):
+        """公式10：L_D3 = -1/N * sum(log(D3(z)) + log(1-D3(G3(y'))))"""
+        d3_real_mean = D3_out_real.view(D3_out_real.shape[0], -1).mean(dim=1)
+        log_real = torch.log(d3_real_mean + self.epsilon)
+        d3_fake_mean = D3_out_fake.view(D3_out_fake.shape[0], -1).mean(dim=1)
+        log_fake = torch.log(1 - d3_fake_mean + self.epsilon)
+        return -torch.mean(log_real + log_fake)
+
+    # ---------------------- 循环一致性损失 ----------------------
+    def calc_L_C(self, G2_G1_xz, x, G1_G2_yprime_z, yprime):
+        """公式15：L_C = 前向循环L1 + 反向循环L1"""
+        forward_cycle = F.l1_loss(G2_G1_xz, x, reduction='mean')
+        backward_cycle = F.l1_loss(G1_G2_yprime_z, yprime, reduction='mean')
+        return forward_cycle + backward_cycle
+
+    # ---------------------- 跨模态感知损失 ----------------------
+    def calc_L_CMP(self, G3_G1_xz, z):
+        """公式14：L_CMP = VGG特征的L1损失"""
+        feat_gen = self.vgg_extractor(G3_G1_xz)
+        feat_z = self.vgg_extractor(z)
+        return F.l1_loss(feat_gen, feat_z, reduction='mean')
+
+    # ---------------------- 阶段总损失 ----------------------
+    def calc_L_total_s1(self, L_G1, L_G2, L_C):
+        """公式3：第一阶段总损失 = L_TG_s1 + β*L_C"""
+        L_TG_s1 = L_G1 + L_G2
+        return L_TG_s1 + self.β * L_C
+
+    def calc_L_total_s2(self, L_G3, L_CMP):
+        """公式4：第二阶段总损失 = L_TG_s2 + γ*L_CMP"""
+        L_TG_s2 = L_G3
+        return L_TG_s2 + self.γ * L_CMP

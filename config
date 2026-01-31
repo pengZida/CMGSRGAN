@@ -1,0 +1,30 @@
+import torch
+
+# ===================== 设备配置 =====================
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+N_GPUS = torch.cuda.device_count()  # 自动检测GPU数量（适配3个2080Ti）
+
+# ===================== 训练超参数（严格匹配你的训练细节） =====================
+BATCH_SIZE = 8
+STAGE1_ITER = 20000    # 第一阶段迭代数
+STAGE2_ITER = 10000    # 第二阶段迭代数
+FINETUNE_ITER = 2000   # 微调迭代数
+STAGE1_LR = 2e-4       # 第一阶段初始LR
+STAGE2_LR = 1e-4       # 第二阶段初始LR
+FINETUNE_LR = 1e-5     # 微调LR
+LR_DECAY_STEP = 1000   # 每1000迭代LR减半
+BETA = 5.0             # 循环一致性损失权重
+GAMMA = 0.5            # 跨模态感知损失权重
+VGG_LAYERS = 16        # VGG19特征提取的前l层
+CAB_REDUCTION = 16     # CAB的通道降维系数
+G3_MID_CHANNELS = 64   # G3的中间通道数
+NUM_CAB = 3            # G3的级联CAB数量
+
+# ===================== 路径配置 =====================
+CHECKPOINT_SAVE_PATH = "./checkpoints/"  # 权重保存目录
+STAGE1_CKPT = CHECKPOINT_SAVE_PATH + "stage1_checkpoint.pth"
+STAGE2_CKPT = CHECKPOINT_SAVE_PATH + "stage2_checkpoint.pth"
+FINAL_CKPT = CHECKPOINT_SAVE_PATH + "final_checkpoint.pth"
+
+# ===================== 数据集配置（可根据需求修改） =====================
+DATASET_NUM_WORKERS = 4  # DataLoader的工作线程数（根据GPU/CPU调整）

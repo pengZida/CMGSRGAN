@@ -1,0 +1,70 @@
+import torch
+import torch.nn as nn
+from config import G3_MID_CHANNELS, NUM_CAB, CAB_REDUCTION  # 导入配置参数
+
+class ChannelAttentionBlock(nn.Module):
+    """第二阶段：标准CAB通道注意力块（GAP+MLP+Sigmoid）"""
+    def __init__(self, in_channels, reduction=CAB_REDUCTION):
+        super().__init__()
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        B, C, _, _ = x.shape
+        attn = self.gap(x).view(B, C)
+        attn = self.mlp(attn).view(B, C, 1, 1)
+        attn = self.sigmoid(attn)
+        out = x * attn
+        return out
+
+class G3_Generator(nn.Module):
+    """第二阶段：G3超分生成器（输入256x256初始重建图，输出512x512最终超分图）"""
+    def __init__(self, in_channels=3, mid_channels=G3_MID_CHANNELS, num_cab=NUM_CAB, reduction=CAB_REDUCTION):
+        super().__init__()
+        self.num_cab = num_cab
+        # 初始双卷积+LReLU
+        self.init_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, 3, 1, 1, padding_mode='reflect'),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(mid_channels, mid_channels, 3, 1, 1, padding_mode='reflect'),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        # 3个级联密集连接CAB
+        self.cabs = nn.ModuleList([
+            ChannelAttentionBlock(mid_channels * (i+1), reduction)
+            for i in range(num_cab)
+        ])
+        # 密集特征融合卷积
+        self.fusion_conv = nn.Conv2d(
+            mid_channels * (num_cab + 1), mid_channels, 3, 1, 1, padding_mode='reflect'
+        )
+        # 上采样x2（256→512）
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        # 最终精修卷积+Tanh输出
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(mid_channels, mid_channels, 3, 1, 1, padding_mode='reflect'),
+            nn.Conv2d(mid_channels, mid_channels, 3, 1, 1, padding_mode='reflect'),
+            nn.Conv2d(mid_channels, 3, 3, 1, 1, padding_mode='reflect'),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        feat = self.init_conv(x)
+        cab_feats = [feat]
+        # 级联CAB+密集连接
+        for i in range(self.num_cab):
+            concat_feat = torch.cat(cab_feats, dim=1)
+            cab_out = self.cabs[i](concat_feat)
+            cab_feats.append(cab_out)
+        # 融合所有密集特征
+        all_feat = torch.cat(cab_feats, dim=1)
+        fused_feat = self.fusion_conv(all_feat)
+        # 上采样+精修
+        up_feat = self.upsample(fused_feat)
+        sr_img = self.final_conv(up_feat)
+        return sr_img
