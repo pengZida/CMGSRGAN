@@ -1,5 +1,5 @@
 # CMGSRGAN
-This repository contains the source code for the paper "Cross-Modal Guided GAN for Enhanced Super-Resolution of Clinical Skin Tumor Images".
+This repository contains the source code for the paper "Cross-Modal Guided GAN for Enhanced Super-Resolution of Clinical Skin Tumor Images" in 《The Visual Computer》.
 # Requirements
 torch==1.8.0
 torchvision==0.9.0
