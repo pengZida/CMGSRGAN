@@ -27,7 +27,7 @@ def train():
     dataloader_iter = iter(dataloader)
 
     # 3. 初始化所有模型并移至设备
-    # 第一阶段模型
+    # 第一阶段模型（dual_encoder+金字塔+注意力+融合+G1+G2）
     dual_encoder = DualPathEncoding().to(DEVICE)
     feature_pyramid = MultiScaleFeaturePyramid().to(DEVICE)
     cross_attn = HierarchicalCrossModalAttention().to(DEVICE)
@@ -172,9 +172,18 @@ def train():
     }, STAGE1_CKPT)
     print(f"\n第一阶段训练完成，权重保存至：{STAGE1_CKPT}")
 
-    # ---------------------- 阶段2：训练第二阶段（10000迭代） ----------------------
+#=========================================================================
+    print("\n【关键操作】冻结第一阶段所有模型参数（dual_encoder+G1+G2+D1+D2）")
+    freeze_modules = [dual_encoder,feature_pyramid,cross_attn,gating_fusion,G1,G2,D1,D2]
+    for module in freeze_modules:
+        for param in module.parameters():
+            param.requires_grad = False  # 禁止参数更新
+        module.eval()  # BN/IN层固定均值方差，不参与训练
+#=========================================================================
+
+    # ---------------------- 阶段2：训练第二阶段（10000迭代）----------------------
     print("\n" + "="*50)
-    print("开始训练第二阶段（Stage2: 10000迭代）")
+    print("开始训练第二阶段（Stage2: 10000迭代）【第一阶段已冻结】")
     print("="*50)
     G3.train()
     D3.train()
@@ -199,18 +208,16 @@ def train():
 
         # ---------------------- 训练生成器 G3 ----------------------
         optim_G3.zero_grad()
-        # 先通过G1生成y'（第一阶段模型固定，无需梯度）
-        with torch.no_grad():
-            lr_feats, de_feats = dual_encoder(x, z)
-            lr_scales, de_scales = feature_pyramid(lr_feats, de_feats)
-            weighted_feats = cross_attn(lr_scales, de_scales)
-            fused_feat, _ = gating_fusion(weighted_feats)
-            yprime = G1(fused_feat)
+        lr_feats, de_feats = dual_encoder(x, z)
+        lr_scales, de_scales = feature_pyramid(lr_feats, de_feats)
+        weighted_feats = cross_attn(lr_scales, de_scales)
+        fused_feat, _ = gating_fusion(weighted_feats)
+        yprime = G1(fused_feat)
         # G3前向：y' → 512x512超分图
         G3_G1_xz = G3(yprime)
         # D3输出
         D3_out_fake = D3(z, G3_G1_xz)
-        # 计算损失并反向传播
+        # 计算损失并反向传播（仅G3梯度更新）
         L_G3 = loss_calc.calc_L_G3(D3_out_fake)
         L_CMP = loss_calc.calc_L_CMP(G3_G1_xz, z)
         L_total_s2 = loss_calc.calc_L_total_s2(L_G3, L_CMP)
@@ -238,21 +245,19 @@ def train():
     }, STAGE2_CKPT)
     print(f"\n第二阶段训练完成，权重保存至：{STAGE2_CKPT}")
 
+#=========================================================================
+    print("\n【关键操作】解冻所有模型参数，准备联合微调")
+    all_modules = [dual_encoder,feature_pyramid,cross_attn,gating_fusion,G1,G2,G3,D1,D2,D3]
+    for module in all_modules:
+        for param in module.parameters():
+            param.requires_grad = True
+        module.train() # 恢复训练模式
+#=========================================================================
+
     # ---------------------- 阶段3：微调整个网络（2000迭代） ----------------------
     print("\n" + "="*50)
-    print("开始微调整个网络（Finetune: 2000迭代）")
+    print("开始微调整个网络（Finetune: 2000迭代）【全参数解冻】")
     print("="*50)
-    # 所有模型设为训练模式
-    dual_encoder.train()
-    feature_pyramid.train()
-    cross_attn.train()
-    gating_fusion.train()
-    G1.train()
-    G2.train()
-    G3.train()
-    D1.train()
-    D2.train()
-    D3.train()
     dataloader_iter = iter(dataloader)  # 重置数据迭代器
 
     for iter_idx in range(1, FINETUNE_ITER + 1):
